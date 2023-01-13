@@ -10,6 +10,8 @@ const ea = exposes.access;
 const globalStore = require('../lib/store');
 const xiaomi = require('../lib/xiaomi');
 const utils = require('../lib/utils');
+const {printNumberAsHex, printNumbersAsHexSequence, readNumberLike} = utils;
+const {xiaomiDefinitions: definitions, xiaomiMappers: mappers, manufacturerCodes} = constants;
 
 const xiaomiExtend = {
     light_onoff_brightness_colortemp: (options={disableColorTempStartup: true}) => ({
@@ -39,6 +41,177 @@ const preventReset = async (type, data, device) => {
         type: 0x41,
     }};
     await device.getEndpoint(1).write('genBasic', payload, options);
+};
+
+// Note: this is valid typescript-flavored JSDoc
+// eslint-disable-next-line valid-jsdoc
+/**
+ * @param {string} deviceKey
+ * @returns {(message: string) => string}
+ */
+const createLoggerMsgMaker = (deviceKey) => (message) => {
+    return `zigbee-herdsman-converters:xiaomi:${deviceKey}: ${message}`;
+};
+
+/**
+ * @template {Record<string, unknown>} ErrorType
+ * @param {ErrorType} error
+ * @return { { isSuccess: false, error: ErrorType } }
+ */
+const failure = (error) => {
+    return {
+        isSuccess: false,
+        error,
+    };
+};
+
+/**
+ * @typedef {{
+ *  regionId: number,
+ *  action: 'create' | 'update',
+ *  definition: Record<string, number[]>
+ * }} AqaraFP1RegionConfigUpsertCommand
+ *
+ * @typedef {{
+ *  regionId: number,
+ *  action: 'delete',
+ * }} AqaraFP1RegionConfigDeleteCommand
+ *
+ * @typedef {AqaraFP1RegionConfigUpsertCommand | AqaraFP1RegionConfigDeleteCommand} AqaraFP1RegionConfigCommand
+ */
+
+// Note: let TypeScript infer the return type to enable union discrimination
+// eslint-disable-next-line valid-jsdoc
+/**
+ * @param {string} input
+ */
+const parseAqaraFp1RegionsConfigInput = (input) => {
+    if (!input.length) {
+        return failure({isEmpty: true});
+    }
+
+    let inputJSON;
+
+    try {
+        inputJSON = JSON.parse(input);
+    } catch (error) {
+        return failure({isInvalid: true, invalidReason: 'INVALID_JSON'});
+    }
+
+    if (!Array.isArray(inputJSON)) {
+        return failure({isInvalid: true, invalidReason: 'NOT_ARRAY'});
+    }
+
+    const hasInvalidEntry = inputJSON.some((entry) => {
+        // Missing / invalid regionId
+        if (
+            typeof entry.regionId !== 'number' ||
+            entry.regionId < definitions.aqara_fp1.region_config_regionId_min ||
+            entry.regionId > definitions.aqara_fp1.region_config_regionId_max
+        ) {
+            return true;
+        }
+
+        // Invalid action
+        if (![...mappers.aqara_fp1.region_config_cmd_type_names.values()].includes(entry.action)) {
+            return true;
+        }
+
+        // For "delete" action, there's nothing else to validate
+        const deleteActionType = definitions.aqara_fp1.region_config_cmd_types.Delete;
+        const deleteActionName = mappers.aqara_fp1.region_config_cmd_type_names.get(deleteActionType);
+        if (entry.action === deleteActionName) {
+            return false;
+        }
+
+        // Missing / invalid definition
+        if (
+            !entry.definition ||
+            !Object.entries(entry.definition).length
+        ) {
+            return true;
+        }
+
+        const hasInvalidDefinition = Object.entries(entry.definition).some(([rowYIdx, rowXMarkers]) => {
+            const rowYIdxNumber = parseInt(rowYIdx, 10);
+
+            // Invalid Y coordinate
+            if (
+                Number.isNaN(rowYIdxNumber) ||
+                rowYIdxNumber < definitions.aqara_fp1.region_config_zoneY_min ||
+                rowYIdxNumber > definitions.aqara_fp1.region_config_zoneY_max
+            ) {
+                return true;
+            }
+
+            // Invalid / empty X markers list
+            if (
+                !Array.isArray(rowXMarkers) ||
+                !rowXMarkers.length
+            ) {
+                return true;
+            }
+
+            const hasInvalidXMarker = rowXMarkers.some((rowXIdx) => {
+                const rowXIdxNumber = parseInt(rowXIdx, 10);
+
+                // Invalid X coordinate
+                if (
+                    Number.isNaN(rowXIdxNumber) ||
+                    rowXIdxNumber < definitions.aqara_fp1.region_config_zoneX_min ||
+                    rowXIdxNumber > definitions.aqara_fp1.region_config_zoneX_max
+                ) {
+                    return true;
+                }
+
+                return false;
+            });
+
+            return hasInvalidXMarker;
+        });
+
+        return hasInvalidDefinition;
+    });
+
+    if (hasInvalidEntry) {
+        return failure({hasInvalidCommand: true});
+    }
+
+    return {
+        /**
+         * Ensure proper type narrowing & enable type discrimination
+         * @type true
+         */
+        isSuccess: true,
+        payload: {
+            /**
+             * @type { Array<AqaraFP1RegionConfigCommand> }
+             */
+            commandsList: inputJSON,
+        },
+    };
+};
+
+/**
+ * @param {number} cellXIdx
+ * @return {number}
+ */
+const encodeXCellIdx = (cellXIdx) => {
+    return 2 ** (cellXIdx - 1);
+};
+
+/**
+ * @param {number[]} xCells
+ * @return {number}
+ */
+const encodeXCellsDefinition = (xCells) => {
+    if (!xCells.length) {
+        return 0;
+    }
+
+    return xCells.reduce((accumulator, marker) => {
+        return accumulator + encodeXCellIdx(marker);
+    }, 0);
 };
 
 const daysLookup = {
@@ -209,6 +382,83 @@ const fzLocal = {
                 }
             });
             return result;
+        },
+    },
+    aqara_fp1_region_events: {
+        cluster: 'aqaraOpple',
+        type: ['attributeReport', 'readResponse'],
+        convert: (model, msg, publish, options, meta) => {
+            /**
+             * @type {{ region_event?: string; }}
+             */
+            const payload = {};
+
+            const createLoggerMsg = createLoggerMsgMaker('aqara_fp1');
+
+            Object.entries(msg.data).forEach(([key, value]) => {
+                const eventKey = parseInt(key);
+                const eventKeyHex = printNumberAsHex(eventKey, 4);
+
+                switch (eventKey) {
+                case definitions.aqara_fp1.region_event_key: {
+                    if (
+                        !Buffer.isBuffer(value) ||
+                        !(typeof value[0] === 'string' || typeof value[0] === 'number') ||
+                        !(typeof value[1] === 'string' || typeof value[1] === 'number')
+                    ) {
+                        meta.logger.warn(createLoggerMsg(`region_event: Unrecognized payload structure '${JSON.stringify(value)}'`));
+
+                        break;
+                    }
+
+                    /**
+                     * @type {[ regionId: number | string, eventTypeCode: number | string ]}
+                     */
+                    const [regionIdRaw, eventTypeCodeRaw] = value;
+                    const regionId = readNumberLike(regionIdRaw);
+                    const eventTypeCode = readNumberLike(eventTypeCodeRaw);
+
+                    if (Number.isNaN(regionId)) {
+                        meta.logger.warn(createLoggerMsg(`region_event: Invalid regionId "${regionIdRaw}"`));
+
+                        break;
+                    }
+                    if (!Object.values(definitions.aqara_fp1.region_event_types).includes(eventTypeCode)) {
+                        meta.logger.warn(createLoggerMsg(`region_event: Unknown region event type "${eventTypeCode}"`));
+
+                        break;
+                    }
+
+                    const eventTypeName = mappers.aqara_fp1.region_event_type_names[eventTypeCode];
+
+                    meta.logger.debug(createLoggerMsg(`region_event: Triggered event (region "${regionId}", type "${eventTypeName}")`));
+
+                    payload.region_event = `region_${regionId}_${eventTypeName}`;
+
+                    break;
+                }
+                case 0xf7: {
+                    const valueHexSequence = printNumbersAsHexSequence(value, 2);
+
+                    meta.logger.debug(createLoggerMsg(`Unhandled key ${eventKeyHex} = ${valueHexSequence}`));
+
+                    break;
+                }
+                case 0x0142:
+                case 0x0143:
+                case 0x0144:
+                case 0x0146: {
+                    meta.logger.debug(createLoggerMsg(`Unhandled key ${eventKeyHex} = ${value}`));
+
+                    break;
+                }
+                default: {
+                    meta.logger.warn(createLoggerMsg(`Unknown key ${eventKeyHex} = ${value}`));
+                }
+                }
+            });
+
+            return payload;
         },
     },
 };
@@ -413,6 +663,101 @@ const tzLocal = {
                 meta.logger.warn(`zigbee-herdsman-converters:aqara_feeder: Unhandled key ${key}`);
             }
             return {state: {[key]: value}};
+        },
+    },
+    aqara_fp1_regions_config: {
+        key: ['regions_config'],
+        convertSet: async (entity, key, value, meta) => {
+            const createLoggerMsg = createLoggerMsgMaker('aqara_fp1');
+
+            const commandsListWrapper = parseAqaraFp1RegionsConfigInput(value);
+
+            if (!commandsListWrapper.isSuccess) {
+                if (commandsListWrapper.error.isEmpty) {
+                    meta.logger.debug(createLoggerMsg(`regions_config: no configuration commands provided, ignoring`));
+
+                    return;
+                }
+                if (commandsListWrapper.error.isInvalid) {
+                    meta.logger.warn(createLoggerMsg(
+                        `regions_config: ignoring invalid JSON (input: ${value}) ` +
+                        `(reason: ${commandsListWrapper.error.invalidReason})`,
+                    ));
+
+                    return;
+                }
+                if (commandsListWrapper.error.hasInvalidCommand) {
+                    meta.logger.warn(createLoggerMsg(`regions_config: provided input contains an invalid command (input: ${value})`));
+
+                    return;
+                }
+
+                meta.logger.warn(createLoggerMsg(`regions_config: unknown error while parsing configuration commands (input: ${value})`));
+
+                return;
+            }
+
+            for (const command of commandsListWrapper.payload.commandsList) {
+                meta.logger.debug(createLoggerMsg(`trying to ${command.action} region ${command.regionId}`));
+
+                const actionTypeCodeEntry = [...mappers.aqara_fp1.region_config_cmd_type_names.entries()]
+                    .find(([actionTypeCode, actionName]) => {
+                        return actionName === command.action;
+                    });
+
+                if (!actionTypeCodeEntry) {
+                    meta.logger.debug(createLoggerMsg(
+                        `regions_config: unexpected error, ` +
+                        `no action type mapping for '${command.action}', ignoring`,
+                    ));
+
+                    continue;
+                }
+
+                const actionTypeCode = actionTypeCodeEntry[0];
+                const isDeleteCommand = (actionTypeCode == definitions.aqara_fp1.region_config_cmd_types.Delete);
+
+                const deviceConfig = new Uint8Array(7);
+
+                deviceConfig[0] = actionTypeCode;
+                deviceConfig[1] = command.regionId;
+                deviceConfig[6] = isDeleteCommand ?
+                    definitions.aqara_fp1.region_config_cmd_suffix_delete :
+                    definitions.aqara_fp1.region_config_cmd_suffix_upsert;
+
+                if (!isDeleteCommand) {
+                    deviceConfig[2] |= encodeXCellsDefinition(command.definition['1'] || []);
+                    deviceConfig[2] |= encodeXCellsDefinition(command.definition['2'] || []) << 4;
+                    deviceConfig[3] |= encodeXCellsDefinition(command.definition['3'] || []);
+                    deviceConfig[3] |= encodeXCellsDefinition(command.definition['4'] || []) << 4;
+                    deviceConfig[4] |= encodeXCellsDefinition(command.definition['5'] || []);
+                    deviceConfig[4] |= encodeXCellsDefinition(command.definition['6'] || []) << 4;
+                    deviceConfig[5] |= encodeXCellsDefinition(command.definition['7'] || []);
+                } else {
+                    deviceConfig[2] |= 0;
+                    deviceConfig[3] |= 0;
+                    deviceConfig[4] |= 0;
+                    deviceConfig[5] |= 0;
+                }
+
+                meta.logger.info(createLoggerMsg(
+                    `regions_config: ${command.action} region ${command.regionId} ` +
+                    `(${printNumbersAsHexSequence([...deviceConfig], 2)})`,
+                ));
+
+                await entity.write(
+                    'aqaraOpple',
+                    {
+                        [definitions.aqara_fp1.region_config_write_attribute]: {
+                            value: deviceConfig,
+                            type: definitions.aqara_fp1.region_config_write_attribute_type,
+                        },
+                    },
+                    {
+                        manufacturerCode: manufacturerCodes.xiaomi,
+                    },
+                );
+            }
         },
     },
 };
@@ -1471,11 +1816,14 @@ module.exports = [
         zigbeeModel: ['lumi.motion.ac01'],
         model: 'RTCZCGQ11LM',
         vendor: 'Xiaomi',
-        description: 'Aqara presence detector FP1 (regions not supported for now)',
-        fromZigbee: [fz.aqara_opple],
-        toZigbee: [tz.RTCZCGQ11LM_presence, tz.RTCZCGQ11LM_monitoring_mode, tz.RTCZCGQ11LM_approach_distance,
-            tz.aqara_motion_sensitivity, tz.RTCZCGQ11LM_reset_nopresence_status],
-        exposes: [e.presence().withAccess(ea.STATE_GET),
+        description: 'Aqara presence detector FP1 (experimental region support)',
+        fromZigbee: [fz.aqara_opple, fzLocal.aqara_fp1_region_events],
+        toZigbee: [
+            tz.RTCZCGQ11LM_presence, tz.RTCZCGQ11LM_monitoring_mode, tz.RTCZCGQ11LM_approach_distance,
+            tz.aqara_motion_sensitivity, tz.RTCZCGQ11LM_reset_nopresence_status, tzLocal.aqara_fp1_regions_config,
+        ],
+        exposes: [
+            e.presence().withAccess(ea.STATE_GET),
             exposes.enum('presence_event', ea.STATE, ['enter', 'leave', 'left_enter', 'right_leave', 'right_enter', 'left_leave',
                 'approach', 'away']).withDescription('Presence events: "enter", "leave", "left_enter", "right_leave", ' +
                 '"right_enter", "left_leave", "approach", "away"'),
@@ -1486,7 +1834,18 @@ module.exports = [
             exposes.enum('motion_sensitivity', ea.ALL, ['low', 'medium', 'high']).withDescription('Different sensitivities ' +
                 'means different static human body recognition rate and response speed of occupied'),
             exposes.enum('reset_nopresence_status', ea.SET, ['']).withDescription('Reset the status of no presence'),
-            e.device_temperature(), e.power_outage_count()],
+            e.device_temperature(), e.power_outage_count(),
+            exposes.text('regions_config', ea.SET).withDescription('Input used to update device\'s regions configuration. ' +
+                'Provide a JSON-encoded array of commands to be sent to the device, to either "create", "modify" or "delete" regions. ' +
+                'Creating or modifying a region requires zone definitions, specifying which zones of a 7x4 detection grid ' +
+                'should be active for that zone. An example command for creating a new zone: ' +
+                '[{"regionId": 1, "action": "create", "definition": {"1": [1, 2]}}]. ' +
+                'More information available on the Z2M documentation page (https://www.zigbee2mqtt.io/devices/RTCZCGQ11LM.html).'),
+            exposes.enum('region_event', ea.STATE, ['region_*_enter', 'region_*_leave', 'region_*_occupied',
+                'region_*_unoccupied']).withDescription('Most recent region event. Event template is "region_<REGION_ID>_<EVENT_TYPE>", ' +
+                'where <REGION_ID> is region number (1-10), <EVENT_TYPE> is one of "enter", "leave", "occupied", "unoccupied". ' +
+                '"enter" / "leave" events are usually triggered first, followed by "occupied" / "unoccupied" after a couple of seconds.'),
+        ],
         configure: async (device, coordinatorEndpoint, logger) => {
             const endpoint = device.getEndpoint(1);
             await endpoint.read('aqaraOpple', [0x010c], {manufacturerCode: 0x115f});
